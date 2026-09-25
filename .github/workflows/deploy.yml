@@ -14,8 +14,10 @@
 # Per-repository values: SERVICE_NAME, ECR_REPOSITORY, DOCKERFILE_PATH,
 # BUILD_CONTEXT, STABLE_SECONDS.
 #
-# AWS credentials: GitHub OIDC only. Set the repository variable
-# AWS_DEPLOY_ROLE_ARN (Settings -> Secrets and variables -> Actions -> Variables).
+# Repository variables (Settings -> Secrets and variables -> Actions -> Variables):
+#   AWS_DEPLOY_ROLE_ARN  IAM role for GitHub OIDC login (required)
+#   EC2_INSTANCE_ID      instance to deploy to (required)
+#   AWS_REGION           AWS region (optional, default us-east-1)
 # -----------------------------------------------------------------------------
 
 name: Deploy to EC2
@@ -36,15 +38,15 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  AWS_REGION: us-east-1
-  EC2_INSTANCE_ID: i-0d749035d946d750a
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  EC2_INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
   DEPLOYMENT_DIR: /home/ec2-user/weave-socks
 
   # --- per-repository values ---
   SERVICE_NAME: catalogue                       # service name in docker-compose.yml
   ECR_REPOSITORY: weave-socks/catalogue         # must match the image in docker-compose.override.yml
-  DOCKERFILE_PATH: docker/catalogue/Dockerfile
-  BUILD_CONTEXT: .
+  DOCKERFILE_PATH: docker/catalogue/Dockerfile-release
+  BUILD_CONTEXT: build                         # binary built by the test step
   STABLE_SECONDS: 30
 
 jobs:
@@ -56,15 +58,31 @@ jobs:
     timeout-minutes: 30
 
     steps:
+      # Fail early (before any build or push) if the target is not configured.
+      - name: Check deploy settings
+        run: |
+          if [ -z "$EC2_INSTANCE_ID" ]; then
+            echo "::error::Set the repository variable EC2_INSTANCE_ID (Settings -> Secrets and variables -> Actions -> Variables)."
+            exit 1
+          fi
+          echo "Deploying to $EC2_INSTANCE_ID in $AWS_REGION"
+
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Unit tests on Go 1.7 with the vendored dependency list (gvt), same
-      # toolchain as the Dockerfile; a failure stops the job before anything
-      # is pushed to ECR or deployed.
-      - name: Unit tests
+      # Test and compile once (Go 1.7, gvt), retrying the dependency download;
+      # the image then only packages the built binary. A failure stops the job
+      # before anything is pushed.
+      - name: Unit tests and build binary
         run: |
-          git archive HEAD | docker run --rm -i golang:1.7 sh -c 'P=/go/src/github.com/microservices-demo/catalogue; mkdir -p $P && cd $P && tar -x && go get -u github.com/FiloSottile/gvt && gvt restore >/dev/null && go test $(go list ./... | grep -v /vendor/)'
+          mkdir -p build
+          git archive HEAD | docker run --rm -i -v "$PWD/build":/out golang:1.7 sh -c '
+            P=/go/src/github.com/microservices-demo/catalogue; mkdir -p $P && cd $P && tar -x &&
+            go get -u github.com/FiloSottile/gvt &&
+            for n in 1 2 3; do gvt restore && break; echo "gvt restore attempt $n failed"; [ $n = 3 ] && exit 1; sleep 10; done &&
+            go test $(go list ./... | grep -v /vendor/) &&
+            CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o /out/app ./cmd/cataloguesvc &&
+            cp -r images /out/images'
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
